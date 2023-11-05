@@ -8,6 +8,7 @@ readme = "README.md"
 [tool.poetry.dependencies]
 python = "^3.11"
 apache-beam = { version = "2.51.0", extras = ["gcp"] }
+pendulum = "^2.1.2"
 
 [build-system]
 requires = ["poetry-core"]
