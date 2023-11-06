@@ -36,7 +36,7 @@ steps:
         --extra_packages ./dist/*.tar.gz \
         --network "${_NETWORK}" \
         --subnetwork "regions/${_REGION}/subnetworks/dataflow" \
-        --service-account-email "${_SERVICE_ACCOUNT}" \
+        --service_account_email "${_SERVICE_ACCOUNT}" \
         --runner DataflowRunner \
         --save_main_session
 

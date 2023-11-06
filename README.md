@@ -20,6 +20,28 @@ gcloud builds submit --config cloudbuild.yaml --project rocketech-de-pgcp-sandbo
     --substitutions _DATETIME=${DATETIME}
 ```
 
+
+## Run locally (WIP)
+```
+ python bigquery_to_datastore_via_beam/run.py --runner=DataflowRunner --streaming \
+    --subscription_name projects/${PROJECT_ID}/subscriptions/bigquery-to-datastore-via-beam-sub \
+    --source_table_id bigquery_to_datastore_via_beam.fake_pii_data  \
+    --source_timestamp_column last_updated_timestamp \
+    --checkpointing_table_id bigquery_to_datastore_via_beam.checkpointing \
+    --datastore_key_column email \
+    --datastore_namespace demo \
+    --datastore_kind FakePii \
+    --project ${PROJECT_ID} \
+    --region europe-west2 \
+    --temp_location gs://${PROJECT_ID}-temp/bigquery-to-datastore-via-beam/dataflow/temp \
+    --network private \
+    --subnetwork regions/europe-west2/subnetworks/dataflow \
+    --service_account_email dataflow@${PROJECT_ID}.iam.gserviceaccount.com \
+    --max_num_workers 2 \
+    --save_main_session
+   
+```
+
 ## Issues
 A few things currently unresolved
 - `--extra_packages ./dist/*.tar.gz` this doesn't seem required, but it should be, how does the library.py file got included when it's not packaged?

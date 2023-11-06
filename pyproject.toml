@@ -9,6 +9,7 @@ readme = "README.md"
 python = "^3.11"
 apache-beam = { version = "2.51.0", extras = ["gcp"] }
 google-cloud-bigquery = "3.13.0"
+google-cloud-bigquery-storage = "2.22.0"
 
 [build-system]
 requires = ["poetry-core"]
