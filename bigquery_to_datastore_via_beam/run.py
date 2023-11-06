@@ -93,8 +93,8 @@ class FetchDeltaFromBigQuery(beam.DoFn):
         requested_session.table = f'projects/{project_id}/datasets/{dataset_id}/tables/{table_id}'
         requested_session.data_format = types.stream.DataFormat.ARROW
         # TODO: refactor to pass in dynamically
-        requested_session.read_options.selected_fields = ['full_name', 'email', 'address', 'phone_number', 'birthdate',
-                                                          'last_updated_timestamp']
+        requested_session.read_options.selected_fields = ['uuid', 'full_name', 'email', 'address', 'phone_number',
+                                                          'birthdate', 'last_updated_timestamp']
         requested_session.read_options.row_restriction = 'last_updated_timestamp > TIMESTAMP("0001-01-01 00:00:00")'
         parent = "projects/{}".format(project_id)
         session = client.create_read_session(
