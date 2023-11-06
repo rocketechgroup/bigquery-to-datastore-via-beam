@@ -1,11 +1,8 @@
 import argparse
-import datetime as datetime_datetime
 import apache_beam as beam
 
 from datetime import datetime, date as datetime_date
 
-from apache_beam.io import BigQuerySource, ReadFromBigQuery
-from apache_beam.transforms import window
 from apache_beam.options.pipeline_options import PipelineOptions
 from apache_beam.transforms.periodicsequence import PeriodicImpulse
 from google.cloud.bigquery_storage import BigQueryReadClient, types
@@ -119,7 +116,6 @@ def run(argv=None):
     parser.add_argument('--datastore_kind', required=True)
     known_args, pipeline_args = parser.parse_known_args(argv)
 
-    subscription_name = known_args.subscription_name
     source_table_id = known_args.source_table_id
     source_timestamp_column = known_args.source_timestamp_column
     checkpointing_table_id = known_args.checkpointing_table_id
