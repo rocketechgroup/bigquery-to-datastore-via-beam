@@ -148,7 +148,7 @@ def run(argv=None):
                                                               datastore_namespace=datastore_namespace,
                                                               datastore_kind=datastore_kind,
                                                               project_id=project_id)
-                | "Write to Datastore" >> WriteToDatastore(project_id)
+                | "Write to Datastore" >> WriteToDatastore(project_id, throttle_rampup=False)
         )
 
 
