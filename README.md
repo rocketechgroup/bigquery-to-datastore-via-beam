@@ -23,12 +23,11 @@ gcloud builds submit --config cloudbuild.yaml --project rocketech-de-pgcp-sandbo
 
 ## Run locally (WIP)
 ```
-python bigquery_to_datastore_via_beam/run.py --runner=DataflowRunner --streaming \
-    --subscription_name projects/${PROJECT_ID}/subscriptions/bigquery-to-datastore-via-beam-sub \
+python bigquery_to_datastore_via_beam/run.py --runner=DirectRunner --default_sdk_harness_log_level=DEBUG --streaming \
     --source_table_id bigquery_to_datastore_via_beam.fake_pii_data_2  \
     --source_timestamp_column last_updated_timestamp \
     --checkpointing_table_id bigquery_to_datastore_via_beam.checkpointing \
-    --datastore_key_column uuid \ 
+    --datastore_key_column uuid \
     --datastore_namespace demo \
     --datastore_kind FakePii \
     --project ${PROJECT_ID} \
@@ -38,7 +37,7 @@ python bigquery_to_datastore_via_beam/run.py --runner=DataflowRunner --streaming
     --subnetwork regions/europe-west2/subnetworks/dataflow \
     --service_account_email dataflow@${PROJECT_ID}.iam.gserviceaccount.com \
     --max_num_workers 2 \
-    --save_main_session
+    --save_main_session 
    
 ```
 

@@ -1,4 +1,5 @@
 import argparse
+import logging
 import apache_beam as beam
 
 from datetime import datetime, date as datetime_date
@@ -15,6 +16,7 @@ from google.cloud.exceptions import NotFound
 
 class ConvertToDatastoreEntity(beam.DoFn):
     def process(self, record, datastore_namespace, datastore_kind, datastore_key_column, project_id):
+        logging.info("ConvertToDatastoreEntity:" + str(record))
         # Convert BigQuery record to Cloud Datastore entity
         key = Key(
             path_elements=[datastore_kind, str(record[datastore_key_column])],
@@ -32,58 +34,87 @@ class ConvertToDatastoreEntity(beam.DoFn):
         yield entity
 
 
-class QueryForFetchingDeltaFromBigQuery(beam.DoFn):
-    def process(self, element, source_table_id, source_timestamp_column, checkpointing_table_id):
-        """
-            Get the query required to fetch data from BigQuery.
-            Fetch the whole table if no previous checkpointing timestamp is found, otherwise fetch the delta from the
-            previous checkpointing timestamp.
-            :param source_table_id: source table id used to fetch the delta
-            :param source_timestamp_column: timestamp column used to fetch the delta
-            :param checkpointing_table_id: checkpointing table id used to store the last timestamp
-            :return: query to fetch the delta
-            """
-        client = bigquery.Client()
-
-        # Try to fetch the last checkpointing timestamp
-        last_processed_timestamp = None
-        try:
+class GetFiltersForBigQuery(beam.DoFn):
+    def process(self, impulse_timestamp, source_table_id, source_timestamp_column, checkpointing_table_id,
+                impulse_start_timestamp, impulse_fire_interval):
+        def fetch_last_processed_timestamp():
             query = f"""
-                        SELECT max(last_processed_timestamp) as last_processed_timestamp FROM `{checkpointing_table_id}`
-                        WHERE table_id = '{source_table_id}'
-                        """
+                    SELECT max(last_processed_timestamp) as last_processed_timestamp FROM `{checkpointing_table_id}`
+                    WHERE table_id = '{source_table_id}'
+                    """
             job = client.query(query)
             results = job.result()
             row = next(iter(results))
             if row['last_processed_timestamp']:
-                last_processed_timestamp = row['last_processed_timestamp']
+                result = row['last_processed_timestamp']
             else:
-                last_processed_timestamp = datetime.min
+                result = datetime.min
 
-        except NotFound as e:
-            print(e)
-            # create the table if it's not there.
-            query = f"""
-                CREATE TABLE `{checkpointing_table_id}` (
-                    uuid STRING,
-                    table_id STRING,
-                    last_processed_timestamp TIMESTAMP
-                );
-                """
-            job = client.query(query)
-            job.result()
+            return result
 
-        query = f"""
-            SELECT * FROM `{source_table_id}`
-            WHERE {source_timestamp_column} > TIMESTAMP('{last_processed_timestamp}')
+        logging.info('impulse_timestamp:' + str(impulse_timestamp))
+        logging.info('impulse_start_timestamp:' + str(impulse_start_timestamp))
+        client = bigquery.Client()
+
+        last_processed_timestamp = None
+        if impulse_start_timestamp == impulse_timestamp:  # first time the job runs
+            """
+            Check if there is a checkpoint in the database, if there is no checkpoint, fetch the whole table.
+            If there is a checkpoint in the database, it means that the job has run before, so we need to fetch the
+            checkpoint timestamp and use it as the start timestamp for the query.
+            
+            We should never update the checkpoint in the database when the job is running for the first time. If we do
+            and the job fails, we've already updated the checkpoint and we'll lose data. 
             """
 
-        yield query
+            try:
+                last_processed_timestamp = fetch_last_processed_timestamp()
+            except NotFound as e:
+                # create the table if it's not there.
+                query = f"""
+                            CREATE TABLE `{checkpointing_table_id}` (
+                                table_id STRING,
+                                last_processed_timestamp TIMESTAMP,
+                                row_updated_timestamp TIMESTAMP
+                            );
+                            """
+                job = client.query(query)
+                job.result()
+                last_processed_timestamp = datetime.min
+
+        else:
+            """
+            This is the second or subsequent time the job is running. We need to first update the checkpoint using 
+            (impulse_timestamp - the interval) = the last processed timestamp. This ensures that we don't miss any
+            data between the `start` of the previous impulse and the `start` of the current impulse. 
+            """
+            last_processed_timestamp = datetime.fromtimestamp(impulse_timestamp - impulse_fire_interval)
+            last_processed_timestamp_from_db = fetch_last_processed_timestamp()
+            if last_processed_timestamp_from_db == datetime.min:
+                query = f"""
+                        INSERT INTO `{checkpointing_table_id}` (table_id, last_processed_timestamp, row_updated_timestamp)
+                        VALUES ('{source_table_id}', '{last_processed_timestamp.isoformat()}', CURRENT_TIMESTAMP())
+                        """
+                job = client.query(query)
+                job.result()
+            else:
+                query = f"""
+                        UPDATE `{checkpointing_table_id}` 
+                        SET last_processed_timestamp = '{last_processed_timestamp.isoformat()}', 
+                        row_updated_timestamp = CURRENT_TIMESTAMP()
+                        WHERE table_id = '{source_table_id}'
+                        """
+                job = client.query(query)
+                job.result()
+
+        filters = f"{source_timestamp_column} > TIMESTAMP('{last_processed_timestamp.isoformat()}') "
+
+        yield filters
 
 
 class FetchDeltaFromBigQuery(beam.DoFn):
-    def process(self, query, project_id, source_table_id):
-        print("FetchDeltaFromBigQuery:" + str(query))
+    def process(self, filters, project_id, source_table_id):
+        logging.info("FetchDeltaFromBigQuery:" + str(filters))
         client = BigQueryReadClient()
         requested_session = types.stream.ReadSession()
         dataset_id, table_id = source_table_id.split('.')
@@ -92,7 +123,7 @@ class FetchDeltaFromBigQuery(beam.DoFn):
         # TODO: refactor to pass in dynamically
         requested_session.read_options.selected_fields = ['uuid', 'full_name', 'email', 'address', 'phone_number',
                                                           'birthdate', 'last_updated_timestamp']
-        requested_session.read_options.row_restriction = 'last_updated_timestamp > TIMESTAMP("0001-01-01 00:00:00")'
+        requested_session.read_options.row_restriction = f'{filters}'
         parent = "projects/{}".format(project_id)
         session = client.create_read_session(
             parent=parent,
@@ -106,8 +137,8 @@ class FetchDeltaFromBigQuery(beam.DoFn):
 
 
 def run(argv=None):
+    logging.getLogger().setLevel(logging.INFO)
     parser = argparse.ArgumentParser()
-    parser.add_argument('--subscription_name', required=True)  # subscription_name of the pubsub topic as the trigger
     parser.add_argument('--source_table_id', required=True)  # dataset.table_id
     parser.add_argument('--source_timestamp_column', required=True)
     parser.add_argument('--checkpointing_table_id', required=True)  # dataset.table_id
@@ -127,17 +158,26 @@ def run(argv=None):
     pipeline_options = PipelineOptions(pipeline_args)
     project_id = pipeline_options.get_all_options()['project']
 
+    impulse_start_timestamp = datetime.utcnow().timestamp()
+    impulse_fire_interval = 30  # seconds
+
+    logging.info('Starting pipeline')
+
     with beam.Pipeline(options=pipeline_options) as pipeline:
         (
                 pipeline
-                | 'Start Impulse' >> PeriodicImpulse(start_timestamp=datetime.utcnow().timestamp(),
-                                                     stop_timestamp=MAX_TIMESTAMP, fire_interval=30)
-                | 'Trigger' >> beam.Map(lambda x: print("Impulse:" + str(x)))
-                | "Get the Query for Delta from BigQuery" >> beam.ParDo(QueryForFetchingDeltaFromBigQuery(),
-                                                                        source_table_id=source_table_id,
-                                                                        source_timestamp_column=source_timestamp_column,
-                                                                        checkpointing_table_id=checkpointing_table_id)
-                | "Fetch delta from BigQuery" >> beam.ParDo(FetchDeltaFromBigQuery(), project_id=project_id,
+                | 'Start Impulse' >> PeriodicImpulse(start_timestamp=impulse_start_timestamp,
+                                                     stop_timestamp=MAX_TIMESTAMP, fire_interval=impulse_fire_interval)
+                | "Get Filters for BigQuery" >>
+                beam.ParDo(GetFiltersForBigQuery(),
+                           source_table_id=source_table_id,
+                           source_timestamp_column=source_timestamp_column,
+                           checkpointing_table_id=checkpointing_table_id,
+                           impulse_start_timestamp=impulse_start_timestamp,
+                           impulse_fire_interval=impulse_fire_interval)
+
+                | "Fetch delta from BigQuery" >> beam.ParDo(FetchDeltaFromBigQuery(),
+                                                            project_id=project_id,
                                                             source_table_id=source_table_id)
                 | "Convert to Datastore Entity" >> beam.ParDo(ConvertToDatastoreEntity(),
                                                               datastore_key_column=datastore_key_column,
