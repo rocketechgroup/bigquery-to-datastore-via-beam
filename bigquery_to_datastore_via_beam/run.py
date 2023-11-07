@@ -16,7 +16,6 @@ from google.cloud.exceptions import NotFound
 
 class ConvertToDatastoreEntity(beam.DoFn):
     def process(self, record, datastore_namespace, datastore_kind, datastore_key_column, project_id):
-        logging.info("ConvertToDatastoreEntity:" + str(record))
         # Convert BigQuery record to Cloud Datastore entity
         key = Key(
             path_elements=[datastore_kind, str(record[datastore_key_column])],
