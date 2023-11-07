@@ -4,12 +4,9 @@ This is a sample project to show how to use Apache Beam to read data from BigQue
 
 ## How does this work
 
-1. Poetry is used here to make the development process easier to manage
-2. Poetry is then used in the build process to get all the dependencies build in order to submit the dataflow job
-3. Cloud Build is used to orchestrate the build process and submit the job to Dataflow
+This design is based on deploying a streaming beam job using Impulse. It pulls data from a BigQuery in a fixed interval, does checkpointing automatically and stream data into Datastore at scale.
 
-The thought behind this build process is to keep things as simple as possible. Without needing a dataflow template
-or containers. This is a simple python script that is submitted to dataflow.
+![beam impulse design](Impulse_based_design_on_beam.png) 
 
 ## Submit via Cloud Build
 
