@@ -1,9 +1,11 @@
 import argparse
 import logging
+import yaml
 import apache_beam as beam
 
 from datetime import datetime, date as datetime_date
 
+from google.cloud import storage
 from apache_beam.options.pipeline_options import PipelineOptions
 from apache_beam.transforms.periodicsequence import PeriodicImpulse
 from google.cloud.bigquery_storage import BigQueryReadClient, types
@@ -12,6 +14,57 @@ from apache_beam.io.gcp.datastore.v1new.types import Entity, Key
 from apache_beam.utils.timestamp import MAX_TIMESTAMP
 from google.cloud import bigquery
 from google.cloud.exceptions import NotFound
+
+
+def read_yaml_from_gcs(bucket_name, blob_name):
+    """Reads a YAML file from a GCS bucket and parses it into a dictionary."""
+    storage_client = storage.Client()
+    bucket = storage_client.bucket(bucket_name)
+    blob = bucket.blob(blob_name)
+
+    # Read the blob's content into an in-memory string
+    yaml_string = blob.download_as_text()
+
+    # Parse the YAML string into a Python dictionary
+    yaml_content = yaml.safe_load(yaml_string)
+
+    return yaml_content
+
+
+def create_pipeline(pipeline_options, pipeline_config, impulse_start_timestamp, impulse_fire_interval, project_id):
+    checkpointing_table_id = pipeline_config['checkpointing_table_id']
+    pipeline_name = pipeline_config['name']
+    source_table_id = pipeline_config['source_table_id']
+    source_timestamp_column = pipeline_config['source_timestamp_column']
+    datastore_key_column = pipeline_config['datastore_key_column']
+    datastore_namespace = pipeline_config['datastore_namespace']
+    datastore_kind = pipeline_config['datastore_kind']
+    source_table_columns = pipeline_config['source_table_columns']
+
+    with beam.Pipeline(options=pipeline_options) as pipeline:
+        (
+                pipeline
+                | f'Start Impulse {pipeline_name}' >> PeriodicImpulse(start_timestamp=impulse_start_timestamp,
+                                                                      stop_timestamp=MAX_TIMESTAMP,
+                                                                      fire_interval=impulse_fire_interval)
+                | f"Get Filters for BigQuery {pipeline_name}" >> beam.ParDo(GetFiltersForBigQuery(),
+                                                                            source_table_id=source_table_id,
+                                                                            source_timestamp_column=source_timestamp_column,
+                                                                            checkpointing_table_id=checkpointing_table_id,
+                                                                            impulse_start_timestamp=impulse_start_timestamp,
+                                                                            impulse_fire_interval=impulse_fire_interval)
+
+                | f"Fetch delta from BigQuery {pipeline_name}" >> beam.ParDo(FetchDeltaFromBigQuery(),
+                                                                             project_id=project_id,
+                                                                             source_table_id=source_table_id,
+                                                                             source_table_columns=source_table_columns)
+                | f"Convert to Datastore Entity {pipeline_name}" >> beam.ParDo(ConvertToDatastoreEntity(),
+                                                                               datastore_key_column=datastore_key_column,
+                                                                               datastore_namespace=datastore_namespace,
+                                                                               datastore_kind=datastore_kind,
+                                                                               project_id=project_id)
+                | f"Write to Datastore {pipeline_name}" >> WriteToDatastore(project_id, throttle_rampup=False)
+        )
 
 
 class ConvertToDatastoreEntity(beam.DoFn):
@@ -36,16 +89,31 @@ class ConvertToDatastoreEntity(beam.DoFn):
 class GetFiltersForBigQuery(beam.DoFn):
     def process(self, impulse_timestamp, source_table_id, source_timestamp_column, checkpointing_table_id,
                 impulse_start_timestamp, impulse_fire_interval):
-        def fetch_last_processed_timestamp():
+
+        def fetch_max_timestamp_from_source():
             query = f"""
-                    SELECT max(last_processed_timestamp) as last_processed_timestamp FROM `{checkpointing_table_id}`
+                    SELECT max({source_timestamp_column}) as max_timestamp FROM `{source_table_id}`
+                    """
+            job = client.query(query)
+            results = job.result()
+            row = next(iter(results))
+            if row['max_timestamp']:
+                result = row['max_timestamp']
+            else:
+                result = datetime.min  # no data in the table
+
+            return result
+
+        def fetch_last_incomplete_timestamp():
+            query = f"""
+                    SELECT max(last_incomplete_timestamp) as last_incomplete_timestamp FROM `{checkpointing_table_id}`
                     WHERE table_id = '{source_table_id}'
                     """
             job = client.query(query)
             results = job.result()
             row = next(iter(results))
-            if row['last_processed_timestamp']:
-                result = row['last_processed_timestamp']
+            if row['last_incomplete_timestamp']:
+                result = row['last_incomplete_timestamp']
             else:
                 result = datetime.min
 
@@ -55,73 +123,67 @@ class GetFiltersForBigQuery(beam.DoFn):
         logging.info('impulse_start_timestamp:' + str(impulse_start_timestamp))
         client = bigquery.Client()
 
-        last_processed_timestamp = None
-        if impulse_start_timestamp == impulse_timestamp:  # first time the job runs
-            """
-            Check if there is a checkpoint in the database, if there is no checkpoint, fetch the whole table.
-            If there is a checkpoint in the database, it means that the job has run before, so we need to fetch the
-            checkpoint timestamp and use it as the start timestamp for the query.
-            
-            We should never update the checkpoint in the database when the job is running for the first time. If we do
-            and the job fails, we've already updated the checkpoint and we'll lose data. 
-            """
-
-            try:
-                last_processed_timestamp = fetch_last_processed_timestamp()
-            except NotFound as e:
-                # create the table if it's not there.
-                query = f"""
-                            CREATE TABLE `{checkpointing_table_id}` (
-                                table_id STRING,
-                                last_processed_timestamp TIMESTAMP,
-                                row_updated_timestamp TIMESTAMP
-                            );
-                            """
-                job = client.query(query)
-                job.result()
-                last_processed_timestamp = datetime.min
-
-        else:
-            """
-            This is the second or subsequent time the job is running. We need to first update the checkpoint using 
-            (impulse_timestamp - the interval) = the last processed timestamp. This ensures that we don't miss any
-            data between the `start` of the previous impulse and the `start` of the current impulse. 
-            """
-            last_processed_timestamp = datetime.fromtimestamp(impulse_timestamp - impulse_fire_interval)
-            last_processed_timestamp_from_db = fetch_last_processed_timestamp()
-            if last_processed_timestamp_from_db == datetime.min:
-                query = f"""
-                        INSERT INTO `{checkpointing_table_id}` (table_id, last_processed_timestamp, row_updated_timestamp)
-                        VALUES ('{source_table_id}', '{last_processed_timestamp.isoformat()}', CURRENT_TIMESTAMP())
+        try:
+            # try to get the `from_timestamp` from the checkpointing table
+            from_timestamp = fetch_last_incomplete_timestamp()
+        except NotFound as e:
+            # create the table if it's not there.
+            query = f"""
+                        CREATE TABLE `{checkpointing_table_id}` (
+                            table_id STRING,
+                            last_processed_timestamp TIMESTAMP,
+                            last_incomplete_timestamp TIMESTAMP,
+                            row_updated_timestamp TIMESTAMP
+                        );
                         """
-                job = client.query(query)
-                job.result()
-            else:
-                query = f"""
-                        UPDATE `{checkpointing_table_id}` 
-                        SET last_processed_timestamp = '{last_processed_timestamp.isoformat()}', 
-                        row_updated_timestamp = CURRENT_TIMESTAMP()
-                        WHERE table_id = '{source_table_id}'
-                        """
-                job = client.query(query)
-                job.result()
+            job = client.query(query)
+            job.result()
+            from_timestamp = datetime.min
 
-        filters = f"{source_timestamp_column} > TIMESTAMP('{last_processed_timestamp.isoformat()}') "
+        # work out the `to_timestamp` and to timestamps
+        to_timestamp = fetch_max_timestamp_from_source()
+
+        logging.info('from_timestamp:' + str(from_timestamp))
+        logging.info('to_timestamp:' + str(to_timestamp))
+
+        # if there is no checkpoint, insert a checkpoint
+        from_timestamp_iso_m = from_timestamp.strftime('%Y-%m-%d %H:%M:%S.%f')
+        to_timestamp_iso_m = to_timestamp.strftime('%Y-%m-%d %H:%M:%S.%f')
+        if from_timestamp == datetime.min:
+            query = f"""
+                    INSERT INTO `{checkpointing_table_id}` 
+                        (table_id, last_processed_timestamp, last_incomplete_timestamp, row_updated_timestamp)
+                    VALUES 
+                        ('{source_table_id}', '{from_timestamp_iso_m}', '{to_timestamp_iso_m}', CURRENT_TIMESTAMP())
+                    """
+            job = client.query(query)
+            job.result()
+        else:  # or update the checkpoint
+            query = f"""
+                    UPDATE `{checkpointing_table_id}` 
+                    SET last_processed_timestamp = '{from_timestamp_iso_m}', 
+                        last_incomplete_timestamp = '{to_timestamp_iso_m}', 
+                    row_updated_timestamp = CURRENT_TIMESTAMP()
+                    WHERE table_id = '{source_table_id}'
+                    """
+            job = client.query(query)
+            job.result()
+
+        filters = f"{source_timestamp_column} BETWEEN " \
+                  f"TIMESTAMP('{from_timestamp_iso_m}') AND TIMESTAMP('{to_timestamp_iso_m}')"
 
         yield filters
 
 
 class FetchDeltaFromBigQuery(beam.DoFn):
-    def process(self, filters, project_id, source_table_id):
-        logging.info("FetchDeltaFromBigQuery:" + str(filters))
+    def process(self, filters, project_id, source_table_id, source_table_columns):
+        logging.info("Fetching delta from BigQuery:" + str(filters))
         client = BigQueryReadClient()
         requested_session = types.stream.ReadSession()
         dataset_id, table_id = source_table_id.split('.')
         requested_session.table = f'projects/{project_id}/datasets/{dataset_id}/tables/{table_id}'
         requested_session.data_format = types.stream.DataFormat.ARROW
-        # TODO: refactor to pass in dynamically
-        requested_session.read_options.selected_fields = ['uuid', 'full_name', 'email', 'address', 'phone_number',
-                                                          'birthdate', 'last_updated_timestamp']
+        requested_session.read_options.selected_fields = source_table_columns
         requested_session.read_options.row_restriction = f'{filters}'
         parent = "projects/{}".format(project_id)
         session = client.create_read_session(
@@ -129,30 +191,25 @@ class FetchDeltaFromBigQuery(beam.DoFn):
             read_session=requested_session,
             max_stream_count=1
         )
-        reader = client.read_rows(session.streams[0].name)
-        rows = reader.rows(session)
-        for row in rows:
-            yield row
+        if session.streams:
+            reader = client.read_rows(session.streams[0].name)
+            rows = reader.rows(session)
+            for row in rows:
+                yield row
+        else:
+            logging.info("No delta to process")
 
 
 def run(argv=None):
     logging.getLogger().setLevel(logging.INFO)
     parser = argparse.ArgumentParser()
-    parser.add_argument('--source_table_id', required=True)  # dataset.table_id
-    parser.add_argument('--source_timestamp_column', required=True)
-    parser.add_argument('--checkpointing_table_id', required=True)  # dataset.table_id
-    parser.add_argument('--datastore_key_column', required=True)  # column name of the bigquery table for datastore key
-    parser.add_argument('--datastore_namespace', required=True)
-    parser.add_argument('--datastore_kind', required=True)
+    parser.add_argument('--pipeline_config_bucket', required=True, help='GCS bucket where pipeline config is stored')
+    parser.add_argument('--pipeline_config_blob', required=True, help='Path to the blob in the GCS bucket')
+
     known_args, pipeline_args = parser.parse_known_args(argv)
 
-    source_table_id = known_args.source_table_id
-    source_timestamp_column = known_args.source_timestamp_column
-    checkpointing_table_id = known_args.checkpointing_table_id
-
-    datastore_key_column = known_args.datastore_key_column
-    datastore_namespace = known_args.datastore_namespace
-    datastore_kind = known_args.datastore_kind
+    pipeline_config_bucket = known_args.pipeline_config_bucket
+    pipeline_config_blob = known_args.pipeline_config_blob
 
     pipeline_options = PipelineOptions(pipeline_args)
     project_id = pipeline_options.get_all_options()['project']
@@ -160,31 +217,16 @@ def run(argv=None):
     impulse_start_timestamp = datetime.utcnow().timestamp()
     impulse_fire_interval = 30  # seconds
 
-    logging.info('Starting pipeline')
+    pipeline_config = read_yaml_from_gcs(bucket_name=pipeline_config_bucket,
+                                         blob_name=pipeline_config_blob)
 
-    with beam.Pipeline(options=pipeline_options) as pipeline:
-        (
-                pipeline
-                | 'Start Impulse' >> PeriodicImpulse(start_timestamp=impulse_start_timestamp,
-                                                     stop_timestamp=MAX_TIMESTAMP, fire_interval=impulse_fire_interval)
-                | "Get Filters for BigQuery" >>
-                beam.ParDo(GetFiltersForBigQuery(),
-                           source_table_id=source_table_id,
-                           source_timestamp_column=source_timestamp_column,
-                           checkpointing_table_id=checkpointing_table_id,
-                           impulse_start_timestamp=impulse_start_timestamp,
-                           impulse_fire_interval=impulse_fire_interval)
+    logging.info('Starting pipeline..')
 
-                | "Fetch delta from BigQuery" >> beam.ParDo(FetchDeltaFromBigQuery(),
-                                                            project_id=project_id,
-                                                            source_table_id=source_table_id)
-                | "Convert to Datastore Entity" >> beam.ParDo(ConvertToDatastoreEntity(),
-                                                              datastore_key_column=datastore_key_column,
-                                                              datastore_namespace=datastore_namespace,
-                                                              datastore_kind=datastore_kind,
-                                                              project_id=project_id)
-                | "Write to Datastore" >> WriteToDatastore(project_id, throttle_rampup=False)
-        )
+    create_pipeline(pipeline_options=pipeline_options,
+                    pipeline_config=pipeline_config,
+                    impulse_start_timestamp=impulse_start_timestamp,
+                    impulse_fire_interval=impulse_fire_interval,
+                    project_id=project_id)
 
 
 if __name__ == '__main__':

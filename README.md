@@ -1,32 +1,33 @@
 # BigQuery to Datastore via Beam
 
-This is a sample project to show how to use Apache Beam to read data from BigQuery and write to Datastore.
+This is a sample project to show how to use Apache Beam to read data from BigQuery and write to Datastore in streaming
+mode.
 
 ## How does this work
 
-This design is based on deploying a streaming beam job using Impulse. It pulls data from a BigQuery in a fixed interval, does checkpointing automatically and stream data into Datastore at scale.
+The pipeline is defined in `bigquery_to_datastore_via_beam/run.py`, there are a few key steps require for this to work
 
-![beam impulse design](Impulse_based_design_on_beam.png) 
+- Streaming mode: this is very important as the start time for dataflow is very long (5 minutes ~), and this won't be
+  feasible if your use case is near real time. And the way to achieve this is via `PeriodicImpulse`
+- Checkpointing: this is required to ensure delta tracking and only fetch what's required, the most important thing here
+  is to never rely on time generate by different systems for comparison as time in a distributed environment is
+  unreliable
+- Datastore key: this is required to ensure the same record is not written to Datastore multiple times, this is done by
+  using the primary key of the table as the key for Datastore
+- BigQuery read: we are directly using the storage read API here as the read has to be unbounded to support streaming
+  mode, plus the additional control required for checkpointing
+- Datastore write: WriteToDatastore is used to write to Datastore, but make sure `throttle_rampup` is turned off due to
+  the bug in this library
 
-## Submit via Cloud Build
+## Run locally
 
 ```
-export DATETIME=`date +%Y%m%d-%H%M%S`
+export PROJECT_ID=rocketech-de-pgcp-sandbox
+gcloud storage cp config.yaml gs://${PROJECT_ID}-temp/bigquery-to-datastore-via-beam/config.yaml
 
-gcloud builds submit --config cloudbuild.yaml --project rocketech-de-pgcp-sandbox --region europe-west1 \
-    --substitutions _DATETIME=${DATETIME}
-```
-
-
-## Run locally (WIP)
-```
-python bigquery_to_datastore_via_beam/run.py --runner=DirectRunner --default_sdk_harness_log_level=DEBUG --streaming \
-    --source_table_id bigquery_to_datastore_via_beam.fake_pii_data_2  \
-    --source_timestamp_column last_updated_timestamp \
-    --checkpointing_table_id bigquery_to_datastore_via_beam.checkpointing \
-    --datastore_key_column uuid \
-    --datastore_namespace demo \
-    --datastore_kind FakePii \
+python bigquery_to_datastore_via_beam/run.py --runner=DirectRunner --streaming \
+    --pipeline_config_bucket ${PROJECT_ID}-temp \
+    --pipeline_config_blob bigquery-to-datastore-via-beam/config.yaml \
     --project ${PROJECT_ID} \
     --region europe-west2 \
     --temp_location gs://${PROJECT_ID}-temp/bigquery-to-datastore-via-beam/dataflow/temp \
@@ -38,7 +39,8 @@ python bigquery_to_datastore_via_beam/run.py --runner=DirectRunner --default_sdk
    
 ```
 
-## Issues
-A few things currently unresolved
-- `--extra_packages ./dist/*.tar.gz` this doesn't seem required, but it should be, how does the library.py file got included when it's not packaged?
-- `setup.py` does not seem to be doing anything
+## Run on Dataflow
+
+To run on Dataflow, you need to package it as a template. See
+a [video](https://www.youtube.com/watch?v=SnQ0Jx5nhoc&list=PL4RrzxkjhEKuZJKCjXrtzbECfnZQlp397&index=29) created by me
+with a git repo attached for more details.
