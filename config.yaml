@@ -12,4 +12,4 @@ source_table_columns:
   - "last_updated_timestamp"
 datastore_key_column: "uuid"
 datastore_namespace: "demo"
-datastore_kind: "FakePii2"
+datastore_kind: "FakePiiDemo"

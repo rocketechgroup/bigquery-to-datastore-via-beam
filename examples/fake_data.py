@@ -38,7 +38,7 @@ rows_to_insert = [
         'birthdate': fake.date_of_birth(tzinfo=None, minimum_age=18, maximum_age=90).strftime('%Y-%m-%d'),
         'last_updated_timestamp': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')
     }
-    for _ in range(10)
+    for _ in range(1000)
 ]
 
 # Upload data to BigQuery

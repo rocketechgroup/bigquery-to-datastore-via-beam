@@ -1,5 +1,6 @@
 import argparse
 import logging
+
 import yaml
 import apache_beam as beam
 
@@ -90,6 +91,9 @@ class GetFiltersForBigQuery(beam.DoFn):
     def process(self, impulse_timestamp, source_table_id, source_timestamp_column, checkpointing_table_id,
                 impulse_start_timestamp, impulse_fire_interval):
 
+        impulse_timestamp = datetime.utcfromtimestamp(impulse_timestamp)
+        logging.info('impulse_timestamp:' + str(impulse_timestamp))
+
         def fetch_max_timestamp_from_source():
             query = f"""
                     SELECT max({source_timestamp_column}) as max_timestamp FROM `{source_table_id}`
@@ -104,28 +108,29 @@ class GetFiltersForBigQuery(beam.DoFn):
 
             return result
 
-        def fetch_last_incomplete_timestamp():
+        def fetch_checkpoint():
             query = f"""
-                    SELECT max(last_incomplete_timestamp) as last_incomplete_timestamp FROM `{checkpointing_table_id}`
-                    WHERE table_id = '{source_table_id}'
+                    SELECT last_incomplete_timestamp as last_incomplete_timestamp,
+                            last_impulse_timestamp as last_impulse_timestamp
+                    FROM `{checkpointing_table_id}`
+                    WHERE table_id = '{source_table_id}' LIMIT 1
                     """
             job = client.query(query)
             results = job.result()
             row = next(iter(results))
             if row['last_incomplete_timestamp']:
-                result = row['last_incomplete_timestamp']
+                l_incomplete_timestamp = row['last_incomplete_timestamp']
             else:
-                result = datetime.min
+                l_incomplete_timestamp = datetime.min
 
-            return result
+            return l_incomplete_timestamp, row['last_impulse_timestamp']
 
-        logging.info('impulse_timestamp:' + str(impulse_timestamp))
-        logging.info('impulse_start_timestamp:' + str(impulse_start_timestamp))
         client = bigquery.Client()
 
         try:
-            # try to get the `from_timestamp` from the checkpointing table
-            from_timestamp = fetch_last_incomplete_timestamp()
+            # try to get the `from_timestamp` and `last_impulse_timestamp` from the checkpointing table
+            last_incomplete_timestamp, last_impulse_timestamp = fetch_checkpoint()
+            from_timestamp = last_incomplete_timestamp
         except NotFound as e:
             # create the table if it's not there.
             query = f"""
@@ -133,44 +138,49 @@ class GetFiltersForBigQuery(beam.DoFn):
                             table_id STRING,
                             last_processed_timestamp TIMESTAMP,
                             last_incomplete_timestamp TIMESTAMP,
+                            last_impulse_timestamp TIMESTAMP,
                             row_updated_timestamp TIMESTAMP
                         );
                         """
             job = client.query(query)
             job.result()
             from_timestamp = datetime.min
+            last_impulse_timestamp = impulse_timestamp
 
         # work out the `to_timestamp` and to timestamps
         to_timestamp = fetch_max_timestamp_from_source()
 
-        logging.info('from_timestamp:' + str(from_timestamp))
-        logging.info('to_timestamp:' + str(to_timestamp))
-
         # if there is no checkpoint, insert a checkpoint
-        from_timestamp_iso_m = from_timestamp.strftime('%Y-%m-%d %H:%M:%S.%f')
-        to_timestamp_iso_m = to_timestamp.strftime('%Y-%m-%d %H:%M:%S.%f')
         if from_timestamp == datetime.min:
             query = f"""
-                    INSERT INTO `{checkpointing_table_id}` 
-                        (table_id, last_processed_timestamp, last_incomplete_timestamp, row_updated_timestamp)
-                    VALUES 
-                        ('{source_table_id}', '{from_timestamp_iso_m}', '{to_timestamp_iso_m}', CURRENT_TIMESTAMP())
+                    INSERT INTO `{checkpointing_table_id}`
+                        (table_id, last_processed_timestamp, last_incomplete_timestamp, last_impulse_timestamp, row_updated_timestamp)
+                    VALUES
+                        ('{source_table_id}', '{from_timestamp}', '{to_timestamp}', '{impulse_timestamp}', CURRENT_TIMESTAMP())
                     """
             job = client.query(query)
             job.result()
         else:  # or update the checkpoint
-            query = f"""
-                    UPDATE `{checkpointing_table_id}` 
-                    SET last_processed_timestamp = '{from_timestamp_iso_m}', 
-                        last_incomplete_timestamp = '{to_timestamp_iso_m}', 
-                    row_updated_timestamp = CURRENT_TIMESTAMP()
-                    WHERE table_id = '{source_table_id}'
-                    """
-            job = client.query(query)
-            job.result()
+            """ 
+            But only do it if it's NOT the same impulse window, or it will advance checkpoint by mistake
+            This is because when the pipeline errors out, it will re-run the same impulse window
+            """
+            if last_impulse_timestamp != impulse_timestamp:
+                query = f"""
+                        UPDATE `{checkpointing_table_id}`
+                        SET last_processed_timestamp = '{from_timestamp}',
+                            last_incomplete_timestamp = '{to_timestamp}',
+                            last_impulse_timestamp = '{impulse_timestamp}',
+                            row_updated_timestamp = CURRENT_TIMESTAMP()
+                        WHERE table_id = '{source_table_id}'
+                        """
+                job = client.query(query)
+                job.result()
+            else:
+                logging.info('Not updating checkpoint because it is the same impulse window')
 
-        filters = f"{source_timestamp_column} BETWEEN " \
-                  f"TIMESTAMP('{from_timestamp_iso_m}') AND TIMESTAMP('{to_timestamp_iso_m}')"
+        filters = f"{source_timestamp_column} > TIMESTAMP('{from_timestamp}') AND " \
+                  f"{source_timestamp_column} <= TIMESTAMP('{to_timestamp}')"
 
         yield filters
 
@@ -178,6 +188,7 @@ class GetFiltersForBigQuery(beam.DoFn):
 class FetchDeltaFromBigQuery(beam.DoFn):
     def process(self, filters, project_id, source_table_id, source_table_columns):
         logging.info("Fetching delta from BigQuery:" + str(filters))
+
         client = BigQueryReadClient()
         requested_session = types.stream.ReadSession()
         dataset_id, table_id = source_table_id.split('.')
